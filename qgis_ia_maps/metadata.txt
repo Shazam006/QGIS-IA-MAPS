@@ -6,7 +6,6 @@ author=Shazam006
 email=
 about=Complemento QGIS para automatizar mapas, layouts e exportações por uma interface MCP.
 category=Plugins
-icon=icon.png
 qgisMinimumVersion=3.34
 repository=https://github.com/Shazam006/QGIS-IA-MAPS
 tracker=https://github.com/Shazam006/QGIS-IA-MAPS/issues
