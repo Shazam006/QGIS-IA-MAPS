@@ -1,4 +1,4 @@
-from qgis.PyQt.QtCore import QObject
+from qgis.PyQt.QtCore import QObject, QRectF
 from qgis.PyQt.QtWidgets import QAction, QDockWidget, QWidget, QVBoxLayout, QLabel, QPushButton, QTextEdit
 from qgis.core import QgsProject, QgsPrintLayout, QgsLayoutItemMap, QgsLayoutItemLabel, QgsLayoutItemLegend, QgsLayoutItemScaleBar, QgsLayoutPoint, QgsLayoutSize, QgsUnitTypes, QgsRectangle, QgsLayoutExporter
 
@@ -99,7 +99,7 @@ class QGISIAMaps(QObject):
         layout.pageCollection().page(0).setPageSize(QgsLayoutSize(width, height, QgsUnitTypes.LayoutMillimeters))
         project.layoutManager().addLayout(layout)
         map_item = QgsLayoutItemMap(layout)
-        map_item.attemptSetSceneRect(20, 20, width - 40, height - 50)
+        map_item.setRect(QRectF(20.0, 20.0, float(width - 40), float(height - 50)))
         map_item.setFrameEnabled(True)
         layers = list(project.mapLayers().values())
         if layers:
