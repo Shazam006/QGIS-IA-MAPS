@@ -21,8 +21,10 @@ from qgis.core import (
     QgsLayoutSize,
     QgsUnitTypes,
     QgsLayoutExporter,
+    QgsLayerTree,
 )
 
+from .legend_naming import classify_layer, is_legend_candidate, title_from_name
 from .mcp_bridge import MCPBridge
 
 
@@ -111,7 +113,8 @@ class QGISIAMaps(QObject):
             self.log_message(f"Projeto: {info['path'] or '(não salvo)'}")
             self.log_message(f"Camadas: {info['layer_count']}")
             for layer in self.list_layers():
-                self.log_message(f"- {layer['name']} ({layer['type']})")
+                marker = "ATIVA" if layer["visible"] else "oculta"
+                self.log_message(f"- {layer['name']} [{marker}] ({layer['type']})")
         except Exception as exc:
             self.status.setText("Status: erro")
             self.log_message(f"ERRO: {exc}")
@@ -137,20 +140,49 @@ class QGISIAMaps(QObject):
                     "type": layer.type(),
                     "source": layer.source(),
                     "visible": bool(node and node.isVisible()),
+                    "active_in_canvas": layer in self._visible_canvas_layers(),
                     "crs": layer.crs().authid() if layer.crs().isValid() else None,
+                    "legend_name": title_from_name(layer.name()),
+                    "classification": classify_layer(layer),
                 }
             )
         return result
 
     def _visible_canvas_layers(self):
-        """Return the layers currently displayed by the QGIS map canvas.
+        """Return layers currently displayed by the QGIS map canvas."""
+        return list(self.iface.mapCanvas().layers())
 
-        Using the canvas is important because its extent and layer coordinates
-        are already expressed in the project's destination CRS. Combining raw
-        QgsMapLayer.extent() values from layers with different CRSs is invalid.
+    def _legend_tree_for_active_layers(self):
+        """Build a temporary legend tree without changing project layer names.
+
+        The project layer tree is cloned. Only layers currently displayed in
+        the canvas and considered valid legend candidates remain. Their tree
+        node names are replaced with semantic cartographic labels using
+        setUseLayerName(False), so the actual QgsMapLayer.name() is untouched.
         """
-        canvas = self.iface.mapCanvas()
-        return list(canvas.layers())
+        project = QgsProject.instance()
+        canvas_layers = self._visible_canvas_layers()
+        active_ids = {layer.id() for layer in canvas_layers}
+
+        root = project.layerTreeRoot().clone()
+        for node in list(root.findLayers()):
+            layer = node.layer()
+            keep = (
+                layer is not None
+                and layer.id() in active_ids
+                and is_legend_candidate(layer)
+            )
+            if not keep:
+                parent = node.parent()
+                if parent is not None and QgsLayerTree.isGroup(parent):
+                    QgsLayerTree.toGroup(parent).removeChildNode(node)
+                continue
+
+            node.setName(title_from_name(layer.name()))
+            node.setUseLayerName(False)
+
+        root.removeChildrenGroupWithoutLayers()
+        return root
 
     def create_layout(self, name="Mapa IA", page="A4", orientation="landscape"):
         project = QgsProject.instance()
@@ -177,9 +209,7 @@ class QGISIAMaps(QObject):
         project.layoutManager().addLayout(layout)
 
         map_item = QgsLayoutItemMap(layout)
-        map_item.attemptMove(
-            QgsLayoutPoint(10, 18, QgsUnitTypes.LayoutMillimeters)
-        )
+        map_item.attemptMove(QgsLayoutPoint(10, 18, QgsUnitTypes.LayoutMillimeters))
         map_item.attemptResize(
             QgsLayoutSize(width - 80, height - 48, QgsUnitTypes.LayoutMillimeters)
         )
@@ -214,9 +244,7 @@ class QGISIAMaps(QObject):
         item.setText(str(text))
         item.setFontPointSize(float(size))
         item.adjustSizeToText()
-        item.attemptMove(
-            QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters)
-        )
+        item.attemptMove(QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters))
         layout.addLayoutItem(item)
         return True
 
@@ -225,11 +253,25 @@ class QGISIAMaps(QObject):
         legend = QgsLayoutItemLegend(layout)
         legend.setTitle(str(title))
         legend.setLinkedMap(self._first_map(layout))
+        legend.setAutoUpdateModel(False)
+        legend.model().setRootGroup(self._legend_tree_for_active_layers())
+        legend.refresh()
+        legend.adjustBoxSize()
         legend.attemptMove(
             QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters)
         )
         layout.addLayoutItem(legend)
-        return True
+        return {
+            "success": True,
+            "layers": [
+                {
+                    "original_name": layer.name(),
+                    "legend_name": title_from_name(layer.name()),
+                }
+                for layer in self._visible_canvas_layers()
+                if is_legend_candidate(layer)
+            ],
+        }
 
     def add_scale(self, layout_name, x=10, y=185):
         layout = self._layout(layout_name)
@@ -239,9 +281,7 @@ class QGISIAMaps(QObject):
         scale.setNumberOfSegments(4)
         scale.setNumberOfSegmentsLeft(0)
         scale.setLinkedMap(self._first_map(layout))
-        scale.attemptMove(
-            QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters)
-        )
+        scale.attemptMove(QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters))
         layout.addLayoutItem(scale)
         return True
 
@@ -253,13 +293,9 @@ class QGISIAMaps(QObject):
         fmt = str(format).lower()
         exporter = QgsLayoutExporter(layout)
         if fmt == "png":
-            result = exporter.exportToImage(
-                str(output), QgsLayoutExporter.ImageExportSettings()
-            )
+            result = exporter.exportToImage(str(output), QgsLayoutExporter.ImageExportSettings())
         elif fmt == "pdf":
-            result = exporter.exportToPdf(
-                str(output), QgsLayoutExporter.PdfExportSettings()
-            )
+            result = exporter.exportToPdf(str(output), QgsLayoutExporter.PdfExportSettings())
         else:
             raise ValueError("format deve ser pdf ou png")
         if result != QgsLayoutExporter.Success:
