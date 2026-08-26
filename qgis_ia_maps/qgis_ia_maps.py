@@ -27,6 +27,7 @@ from qgis.core import (
 
 from .legend_naming import classify_layer, is_legend_candidate, title_from_name
 from .mcp_bridge import MCPBridge
+from .zoning import analyze_zoning, find_object_layer, find_zoning_layer
 
 
 class QGISIAMaps(QObject):
@@ -70,6 +71,10 @@ class QGISIAMaps(QObject):
             test_button = QPushButton("Testar projeto atual")
             test_button.clicked.connect(self.test_project)
             layout.addWidget(test_button)
+
+            zoning_button = QPushButton("Analisar zoneamento (500 m)")
+            zoning_button.clicked.connect(self.analyze_zoning_500m)
+            layout.addWidget(zoning_button)
 
             map_button = QPushButton("Criar mapa A4")
             map_button.clicked.connect(self.create_a4_map)
@@ -120,6 +125,35 @@ class QGISIAMaps(QObject):
             self.status.setText("Status: erro")
             self.log_message(f"ERRO: {exc}")
 
+    def analyze_zoning_500m(self):
+        """Identify zoning inside the object and within a 500 m context."""
+        try:
+            layers = self._visible_canvas_layers()
+            area_layer = find_object_layer(layers)
+            zoning_layer = find_zoning_layer(layers)
+            if area_layer is None:
+                raise ValueError(
+                    "Não foi possível identificar a área objeto. Selecione a feição da área objeto ou deixe apenas uma camada poligonal de área ativa."
+                )
+            if zoning_layer is None:
+                raise ValueError(
+                    "Não foi possível identificar a camada de zoneamento entre as camadas ativas."
+                )
+            result = analyze_zoning(area_layer, zoning_layer, buffer_m=500.0, select=True)
+            self.status.setText("Status: zoneamento analisado")
+            self.log_message(
+                f"Área objeto: {result['area_layer']} | Zoneamento: {result['zoning_layer']} | Raio: 500 m"
+            )
+            if not result["zoning"]:
+                self.log_message("Nenhuma zona encontrada dentro da área ou do raio de 500 m.")
+            else:
+                for item in result["zoning"]:
+                    where = "NA ÁREA" if item["inside_object"] else f"{item['distance_m']} m"
+                    self.log_message(f"- {item['zoning_name']} [{where}]")
+        except Exception as exc:
+            self.status.setText("Status: erro no zoneamento")
+            self.log_message(f"ERRO: {exc}")
+
     def project_info(self):
         project = QgsProject.instance()
         return {
@@ -152,11 +186,9 @@ class QGISIAMaps(QObject):
         return result
 
     def _visible_canvas_layers(self):
-        """Return layers currently displayed by the QGIS map canvas."""
         return list(self.iface.mapCanvas().layers())
 
     def _legend_tree_for_active_layers(self):
-        """Build a temporary legend tree without changing project layer names."""
         project = QgsProject.instance()
         canvas_layers = self._visible_canvas_layers()
         active_ids = {layer.id() for layer in canvas_layers}
@@ -182,21 +214,15 @@ class QGISIAMaps(QObject):
         return root
 
     def _polygon_layer_count(self):
-        """Count active polygon layers which are eligible for the legend."""
         return sum(
             1
             for layer in self._visible_canvas_layers()
             if is_legend_candidate(layer)
-            and layer.type() == QgsWkbTypes.VectorGeometry
+            and layer.type() == 0
             and layer.geometryType() == QgsWkbTypes.PolygonGeometry
         )
 
     def _legend_symbol_size(self):
-        """Choose polygon swatch size from the number of active polygons.
-
-        Up to four active polygon layers: 8 x 4 mm.
-        More than four active polygon layers: 4 x 2 mm.
-        """
         polygon_count = self._polygon_layer_count()
         if polygon_count <= 4:
             return 8.0, 4.0, polygon_count
@@ -273,11 +299,9 @@ class QGISIAMaps(QObject):
         legend.setLinkedMap(self._first_map(layout))
         legend.setAutoUpdateModel(False)
         legend.model().setRootGroup(self._legend_tree_for_active_layers())
-
         symbol_width, symbol_height, polygon_count = self._legend_symbol_size()
         legend.setSymbolWidth(symbol_width)
         legend.setSymbolHeight(symbol_height)
-
         legend.refresh()
         legend.adjustBoxSize()
         legend.attemptMove(
@@ -286,15 +310,9 @@ class QGISIAMaps(QObject):
         return {
             "success": True,
             "polygon_layer_count": polygon_count,
-            "symbol_size_mm": {
-                "width": symbol_width,
-                "height": symbol_height,
-            },
+            "symbol_size_mm": {"width": symbol_width, "height": symbol_height},
             "layers": [
-                {
-                    "original_name": layer.name(),
-                    "legend_name": title_from_name(layer.name()),
-                }
+                {"original_name": layer.name(), "legend_name": title_from_name(layer.name())}
                 for layer in self._visible_canvas_layers()
                 if is_legend_candidate(layer)
             ],
