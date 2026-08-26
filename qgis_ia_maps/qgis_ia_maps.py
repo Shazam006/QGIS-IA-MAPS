@@ -1,10 +1,28 @@
+from pathlib import Path
+
 from qgis.PyQt.QtCore import QObject
-from qgis.PyQt.QtWidgets import QAction, QDockWidget, QWidget, QVBoxLayout, QLabel, QPushButton, QTextEdit
-from qgis.core import (
-    QgsProject, QgsPrintLayout, QgsLayoutItemMap, QgsLayoutItemLabel,
-    QgsLayoutItemLegend, QgsLayoutItemScaleBar, QgsLayoutPoint,
-    QgsLayoutSize, QgsUnitTypes, QgsRectangle, QgsLayoutExporter
+from qgis.PyQt.QtWidgets import (
+    QAction,
+    QDockWidget,
+    QWidget,
+    QVBoxLayout,
+    QLabel,
+    QPushButton,
+    QTextEdit,
 )
+from qgis.core import (
+    QgsProject,
+    QgsPrintLayout,
+    QgsLayoutItemMap,
+    QgsLayoutItemLabel,
+    QgsLayoutItemLegend,
+    QgsLayoutItemScaleBar,
+    QgsLayoutPoint,
+    QgsLayoutSize,
+    QgsUnitTypes,
+    QgsLayoutExporter,
+)
+
 from .mcp_bridge import MCPBridge
 
 
@@ -31,6 +49,8 @@ class QGISIAMaps(QObject):
             self.iface.removeToolBarIcon(self.action)
         if self.dock:
             self.iface.removeDockWidget(self.dock)
+            self.dock.deleteLater()
+            self.dock = None
 
     def show_dock(self):
         if self.dock is None:
@@ -43,14 +63,22 @@ class QGISIAMaps(QObject):
             self.log = QTextEdit()
             self.log.setReadOnly(True)
             layout.addWidget(self.log)
+
             test_button = QPushButton("Testar projeto atual")
             test_button.clicked.connect(self.test_project)
             layout.addWidget(test_button)
-            bridge_button = QPushButton("Iniciar ponte local (MCP)")
+
+            map_button = QPushButton("Criar mapa A4")
+            map_button.clicked.connect(self.create_a4_map)
+            layout.addWidget(map_button)
+
+            bridge_button = QPushButton("Iniciar ponte local")
             bridge_button.clicked.connect(self.toggle_bridge)
             layout.addWidget(bridge_button)
+
             self.dock.setWidget(panel)
             self.iface.addDockWidget(2, self.dock)
+
         self.dock.show()
         self.dock.raise_()
 
@@ -66,34 +94,79 @@ class QGISIAMaps(QObject):
             return
         try:
             self.bridge.start()
-            self.status.setText(f"Status: MCP local em {self.bridge.host}:{self.bridge.port}")
-            self.log_message(f"Ponte local iniciada em {self.bridge.host}:{self.bridge.port}.")
+            self.status.setText(
+                f"Status: ponte local em {self.bridge.host}:{self.bridge.port}"
+            )
+            self.log_message(
+                f"Ponte local iniciada em {self.bridge.host}:{self.bridge.port}."
+            )
         except Exception as exc:
-            self.status.setText("Status: erro ao iniciar MCP")
+            self.status.setText("Status: erro ao iniciar ponte")
             self.log_message(f"Erro: {exc}")
 
     def test_project(self):
-        info = self.project_info()
-        self.status.setText("Status: projeto lido")
-        self.log_message(f"Projeto: {info['path'] or '(não salvo)'}")
-        self.log_message(f"Camadas: {info['layer_count']}")
+        try:
+            info = self.project_info()
+            self.status.setText("Status: projeto lido")
+            self.log_message(f"Projeto: {info['path'] or '(não salvo)'}")
+            self.log_message(f"Camadas: {info['layer_count']}")
+            for layer in self.list_layers():
+                self.log_message(f"- {layer['name']} ({layer['type']})")
+        except Exception as exc:
+            self.status.setText("Status: erro")
+            self.log_message(f"ERRO: {exc}")
 
     def project_info(self):
         project = QgsProject.instance()
-        return {"path": project.fileName(), "title": project.title(), "layer_count": len(project.mapLayers())}
+        return {
+            "path": project.fileName(),
+            "title": project.title(),
+            "layer_count": len(project.mapLayers()),
+            "crs": project.crs().authid(),
+        }
 
     def list_layers(self):
-        return [{"id": l.id(), "name": l.name(), "type": l.type(), "source": l.source()} for l in QgsProject.instance().mapLayers().values()]
+        root = QgsProject.instance().layerTreeRoot()
+        result = []
+        for layer in QgsProject.instance().mapLayers().values():
+            node = root.findLayer(layer.id())
+            result.append(
+                {
+                    "id": layer.id(),
+                    "name": layer.name(),
+                    "type": layer.type(),
+                    "source": layer.source(),
+                    "visible": bool(node and node.isVisible()),
+                    "crs": layer.crs().authid() if layer.crs().isValid() else None,
+                }
+            )
+        return result
+
+    def _visible_canvas_layers(self):
+        """Return the layers currently displayed by the QGIS map canvas.
+
+        Using the canvas is important because its extent and layer coordinates
+        are already expressed in the project's destination CRS. Combining raw
+        QgsMapLayer.extent() values from layers with different CRSs is invalid.
+        """
+        canvas = self.iface.mapCanvas()
+        return list(canvas.layers())
 
     def create_layout(self, name="Mapa IA", page="A4", orientation="landscape"):
         project = QgsProject.instance()
         old = project.layoutManager().layoutByName(name)
         if old:
             project.layoutManager().removeLayout(old)
+
+        page_key = page.upper()
+        if page_key not in {"A4", "A3"}:
+            raise ValueError("page deve ser A4 ou A3")
         sizes = {"A4": (297, 210), "A3": (420, 297)}
-        width, height = sizes.get(page.upper(), sizes["A4"])
+        width, height = sizes[page_key]
         if orientation.lower() == "portrait":
             width, height = height, width
+        elif orientation.lower() != "landscape":
+            raise ValueError("orientation deve ser landscape ou portrait")
 
         layout = QgsPrintLayout(project)
         layout.initializeDefaults()
@@ -104,33 +177,24 @@ class QGISIAMaps(QObject):
         project.layoutManager().addLayout(layout)
 
         map_item = QgsLayoutItemMap(layout)
-        # QGIS 3.34's documented API uses layout points/sizes for item placement.
-        map_item.attemptMove(QgsLayoutPoint(20, 20, QgsUnitTypes.LayoutMillimeters))
+        map_item.attemptMove(
+            QgsLayoutPoint(10, 18, QgsUnitTypes.LayoutMillimeters)
+        )
         map_item.attemptResize(
-            QgsLayoutSize(width - 40, height - 50, QgsUnitTypes.LayoutMillimeters)
+            QgsLayoutSize(width - 80, height - 48, QgsUnitTypes.LayoutMillimeters)
         )
         map_item.setFrameEnabled(True)
 
-        layers = list(project.mapLayers().values())
+        layers = self._visible_canvas_layers()
         if layers:
             map_item.setLayers(layers)
-            extent = None
-            for layer in layers:
-                if not hasattr(layer, "extent"):
-                    continue
-                current = layer.extent()
-                if current.isEmpty():
-                    continue
-                if extent is None:
-                    extent = QgsRectangle(current)
-                else:
-                    extent.combineExtentWith(current)
-            if extent:
-                extent.scale(1.10)
-                map_item.setExtent(extent)
+            canvas_extent = self.iface.mapCanvas().extent()
+            if not canvas_extent.isEmpty():
+                canvas_extent.scale(1.05)
+                map_item.setExtent(canvas_extent)
 
         layout.addLayoutItem(map_item)
-        return {"name": name, "page": page, "orientation": orientation}
+        return {"name": name, "page": page_key, "orientation": orientation.lower()}
 
     def _layout(self, name):
         layout = QgsProject.instance().layoutManager().layoutByName(name)
@@ -138,54 +202,74 @@ class QGISIAMaps(QObject):
             raise ValueError(f"Layout não encontrado: {name}")
         return layout
 
-    def add_title(self, layout_name, text, size=14, x=20, y=5):
-        layout = self._layout(layout_name)
-        label = QgsLayoutItemLabel(layout)
-        label.setText(text)
-        label.setFontPointSize(float(size))
-        label.adjustSizeToText()
-        label.attemptMove(QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters))
-        layout.addLayoutItem(label)
-        return True
-
-    def add_legend(self, layout_name, title="Legenda", x=220, y=20):
-        layout = self._layout(layout_name)
+    def _first_map(self, layout):
         maps = [item for item in layout.items() if isinstance(item, QgsLayoutItemMap)]
         if not maps:
             raise ValueError("O layout não possui item de mapa")
+        return maps[0]
+
+    def add_title(self, layout_name, text, size=14, x=10, y=5):
+        layout = self._layout(layout_name)
+        item = QgsLayoutItemLabel(layout)
+        item.setText(str(text))
+        item.setFontPointSize(float(size))
+        item.adjustSizeToText()
+        item.attemptMove(
+            QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters)
+        )
+        layout.addLayoutItem(item)
+        return True
+
+    def add_legend(self, layout_name, title="Legenda", x=225, y=18):
+        layout = self._layout(layout_name)
         legend = QgsLayoutItemLegend(layout)
-        legend.setTitle(title)
-        legend.setLinkedMap(maps[0])
-        legend.attemptMove(QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters))
+        legend.setTitle(str(title))
+        legend.setLinkedMap(self._first_map(layout))
+        legend.attemptMove(
+            QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters)
+        )
         layout.addLayoutItem(legend)
         return True
 
-    def add_scale(self, layout_name, x=20, y=185):
+    def add_scale(self, layout_name, x=10, y=185):
         layout = self._layout(layout_name)
-        maps = [item for item in layout.items() if isinstance(item, QgsLayoutItemMap)]
-        if not maps:
-            raise ValueError("O layout não possui item de mapa")
         scale = QgsLayoutItemScaleBar(layout)
         scale.setStyle("Single Box")
         scale.setUnits(QgsUnitTypes.DistanceMeters)
         scale.setNumberOfSegments(4)
         scale.setNumberOfSegmentsLeft(0)
-        scale.setLinkedMap(maps[0])
-        scale.attemptMove(QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters))
+        scale.setLinkedMap(self._first_map(layout))
+        scale.attemptMove(
+            QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters)
+        )
         layout.addLayoutItem(scale)
         return True
 
     def export_layout(self, layout_name, path, format="pdf"):
         layout = self._layout(layout_name)
+        output = Path(path).expanduser()
+        if not output.parent.exists():
+            output.parent.mkdir(parents=True, exist_ok=True)
+        fmt = str(format).lower()
         exporter = QgsLayoutExporter(layout)
-        if format.lower() == "png":
-            result = exporter.exportToImage(path, QgsLayoutExporter.ImageExportSettings())
+        if fmt == "png":
+            result = exporter.exportToImage(
+                str(output), QgsLayoutExporter.ImageExportSettings()
+            )
+        elif fmt == "pdf":
+            result = exporter.exportToPdf(
+                str(output), QgsLayoutExporter.PdfExportSettings()
+            )
         else:
-            result = exporter.exportToPdf(path, QgsLayoutExporter.PdfExportSettings())
-        return result == QgsLayoutExporter.Success
+            raise ValueError("format deve ser pdf ou png")
+        if result != QgsLayoutExporter.Success:
+            raise RuntimeError(f"Falha ao exportar {fmt}: código {int(result)}")
+        return {"success": True, "path": str(output)}
 
     def save_project(self, path=None):
         project = QgsProject.instance()
         if path:
-            project.setFileName(path)
-        return project.write()
+            project.setFileName(str(Path(path).expanduser()))
+        if not project.write():
+            raise RuntimeError("QGIS não conseguiu salvar o projeto")
+        return {"success": True, "path": project.fileName()}
