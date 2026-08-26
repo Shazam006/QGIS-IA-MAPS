@@ -22,6 +22,7 @@ from qgis.core import (
     QgsUnitTypes,
     QgsLayoutExporter,
     QgsLayerTree,
+    QgsWkbTypes,
 )
 
 from .legend_naming import classify_layer, is_legend_candidate, title_from_name
@@ -131,6 +132,8 @@ class QGISIAMaps(QObject):
     def list_layers(self):
         root = QgsProject.instance().layerTreeRoot()
         result = []
+        active = self._visible_canvas_layers()
+        active_ids = {layer.id() for layer in active}
         for layer in QgsProject.instance().mapLayers().values():
             node = root.findLayer(layer.id())
             result.append(
@@ -140,7 +143,7 @@ class QGISIAMaps(QObject):
                     "type": layer.type(),
                     "source": layer.source(),
                     "visible": bool(node and node.isVisible()),
-                    "active_in_canvas": layer in self._visible_canvas_layers(),
+                    "active_in_canvas": layer.id() in active_ids,
                     "crs": layer.crs().authid() if layer.crs().isValid() else None,
                     "legend_name": title_from_name(layer.name()),
                     "classification": classify_layer(layer),
@@ -153,13 +156,7 @@ class QGISIAMaps(QObject):
         return list(self.iface.mapCanvas().layers())
 
     def _legend_tree_for_active_layers(self):
-        """Build a temporary legend tree without changing project layer names.
-
-        The project layer tree is cloned. Only layers currently displayed in
-        the canvas and considered valid legend candidates remain. Their tree
-        node names are replaced with semantic cartographic labels using
-        setUseLayerName(False), so the actual QgsMapLayer.name() is untouched.
-        """
+        """Build a temporary legend tree without changing project layer names."""
         project = QgsProject.instance()
         canvas_layers = self._visible_canvas_layers()
         active_ids = {layer.id() for layer in canvas_layers}
@@ -183,6 +180,27 @@ class QGISIAMaps(QObject):
 
         root.removeChildrenGroupWithoutLayers()
         return root
+
+    def _polygon_layer_count(self):
+        """Count active polygon layers which are eligible for the legend."""
+        return sum(
+            1
+            for layer in self._visible_canvas_layers()
+            if is_legend_candidate(layer)
+            and layer.type() == QgsWkbTypes.VectorGeometry
+            and layer.geometryType() == QgsWkbTypes.PolygonGeometry
+        )
+
+    def _legend_symbol_size(self):
+        """Choose polygon swatch size from the number of active polygons.
+
+        Up to four active polygon layers: 8 x 4 mm.
+        More than four active polygon layers: 4 x 2 mm.
+        """
+        polygon_count = self._polygon_layer_count()
+        if polygon_count <= 4:
+            return 8.0, 4.0, polygon_count
+        return 4.0, 2.0, polygon_count
 
     def create_layout(self, name="Mapa IA", page="A4", orientation="landscape"):
         project = QgsProject.instance()
@@ -255,14 +273,23 @@ class QGISIAMaps(QObject):
         legend.setLinkedMap(self._first_map(layout))
         legend.setAutoUpdateModel(False)
         legend.model().setRootGroup(self._legend_tree_for_active_layers())
+
+        symbol_width, symbol_height, polygon_count = self._legend_symbol_size()
+        legend.setSymbolWidth(symbol_width)
+        legend.setSymbolHeight(symbol_height)
+
         legend.refresh()
         legend.adjustBoxSize()
         legend.attemptMove(
             QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters)
         )
-        layout.addLayoutItem(legend)
         return {
             "success": True,
+            "polygon_layer_count": polygon_count,
+            "symbol_size_mm": {
+                "width": symbol_width,
+                "height": symbol_height,
+            },
             "layers": [
                 {
                     "original_name": layer.name(),
