@@ -1,13 +1,14 @@
-from qgis.PyQt.QtCore import QObject, QRectF
+from qgis.PyQt.QtCore import QObject
 from qgis.PyQt.QtWidgets import QAction, QDockWidget, QWidget, QVBoxLayout, QLabel, QPushButton, QTextEdit
-from qgis.core import QgsProject, QgsPrintLayout, QgsLayoutItemMap, QgsLayoutItemLabel, QgsLayoutItemLegend, QgsLayoutItemScaleBar, QgsLayoutPoint, QgsLayoutSize, QgsUnitTypes, QgsRectangle, QgsLayoutExporter
-
+from qgis.core import (
+    QgsProject, QgsPrintLayout, QgsLayoutItemMap, QgsLayoutItemLabel,
+    QgsLayoutItemLegend, QgsLayoutItemScaleBar, QgsLayoutPoint,
+    QgsLayoutSize, QgsUnitTypes, QgsRectangle, QgsLayoutExporter
+)
 from .mcp_bridge import MCPBridge
 
 
 class QGISIAMaps(QObject):
-    """QGIS-facing controller for QGIS-IA-MAPS."""
-
     def __init__(self, iface):
         super().__init__()
         self.iface = iface
@@ -55,7 +56,7 @@ class QGISIAMaps(QObject):
 
     def log_message(self, message):
         if self.log:
-            self.log.append(message)
+            self.log.append(str(message))
 
     def toggle_bridge(self):
         if self.bridge.running:
@@ -93,14 +94,23 @@ class QGISIAMaps(QObject):
         width, height = sizes.get(page.upper(), sizes["A4"])
         if orientation.lower() == "portrait":
             width, height = height, width
+
         layout = QgsPrintLayout(project)
         layout.initializeDefaults()
         layout.setName(name)
-        layout.pageCollection().page(0).setPageSize(QgsLayoutSize(width, height, QgsUnitTypes.LayoutMillimeters))
+        layout.pageCollection().page(0).setPageSize(
+            QgsLayoutSize(width, height, QgsUnitTypes.LayoutMillimeters)
+        )
         project.layoutManager().addLayout(layout)
+
         map_item = QgsLayoutItemMap(layout)
-        map_item.setRect(QRectF(20.0, 20.0, float(width - 40), float(height - 50)))
+        # QGIS 3.34's documented API uses layout points/sizes for item placement.
+        map_item.attemptMove(QgsLayoutPoint(20, 20, QgsUnitTypes.LayoutMillimeters))
+        map_item.attemptResize(
+            QgsLayoutSize(width - 40, height - 50, QgsUnitTypes.LayoutMillimeters)
+        )
         map_item.setFrameEnabled(True)
+
         layers = list(project.mapLayers().values())
         if layers:
             map_item.setLayers(layers)
@@ -118,6 +128,7 @@ class QGISIAMaps(QObject):
             if extent:
                 extent.scale(1.10)
                 map_item.setExtent(extent)
+
         layout.addLayoutItem(map_item)
         return {"name": name, "page": page, "orientation": orientation}
 
@@ -139,8 +150,12 @@ class QGISIAMaps(QObject):
 
     def add_legend(self, layout_name, title="Legenda", x=220, y=20):
         layout = self._layout(layout_name)
+        maps = [item for item in layout.items() if isinstance(item, QgsLayoutItemMap)]
+        if not maps:
+            raise ValueError("O layout não possui item de mapa")
         legend = QgsLayoutItemLegend(layout)
         legend.setTitle(title)
+        legend.setLinkedMap(maps[0])
         legend.attemptMove(QgsLayoutPoint(float(x), float(y), QgsUnitTypes.LayoutMillimeters))
         layout.addLayoutItem(legend)
         return True
