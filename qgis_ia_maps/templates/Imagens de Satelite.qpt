@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<Composer title="Imagens de Satelite" name="Imagens de Satelite" version="3.34.15">
-  <Layout name="Imagens de Satelite" units="mm" printResolution="300" worldFileMap="0" worldFileMapId="">
-    <PageCollection>
-      <LayoutItem type="65640" zValue="0" uuid="qgis_ia_maps_page" positionOnPage="0,0" size="297,210" visibility="1" frameEnabled="0" positionLock="false" keepLayerSet="false" excludeFromExports="0" />
-    </PageCollection>
-  </Layout>
-</Composer>
