@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["qgis_ia_maps"]
+packages = ["qgis_ia_maps_server"]
 
 [project]
 name = "qgis-ia-maps"
@@ -17,4 +17,4 @@ dependencies = [
 ]
 
 [project.scripts]
-qgis-ia-maps-server = "qgis_ia_maps_server:main"
+qgis-ia-maps-server = "qgis_ia_maps_server.server:main"
