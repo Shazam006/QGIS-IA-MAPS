@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout QGIS-IA-MAPS
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Import upstream source
         run: |
@@ -36,4 +38,5 @@ jobs:
             exit 0
           fi
           git commit -m "Import upstream qgis-mcp source"
-          git push
+          git pull --rebase origin main
+          git push origin HEAD:main
