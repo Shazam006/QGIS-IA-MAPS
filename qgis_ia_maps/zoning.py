@@ -3,7 +3,7 @@
 The analysis is deterministic and uses the actual zoning layer attributes. It
 finds the object area, builds a metric 500 m buffer, intersects that buffer
 with zoning polygons, extracts the zoning name from likely attributes, and
-can select only the relevant zoning features. The original layer names and
+selects only the relevant zoning features. The original layer names and
 geometries are not modified.
 """
 
@@ -15,8 +15,6 @@ from qgis.core import (
     QgsCoordinateTransform,
     QgsFeatureRequest,
     QgsProject,
-    QgsSpatialIndex,
-    QgsUnitTypes,
     QgsWkbTypes,
 )
 
@@ -54,18 +52,28 @@ def _norm(value):
 
 
 def _utm_crs_for_geometry(geometry, source_crs):
-    """Choose a SIRGAS 2000 UTM CRS from the geometry centroid."""
+    """Choose a metric SIRGAS 2000 UTM CRS from the geometry centroid."""
     project = QgsProject.instance()
     wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
     centroid = geometry.centroid()
-    if source_crs.authid() != wgs84.authid():
-        transform = QgsCoordinateTransform(source_crs, wgs84, project)
-        centroid.transform(transform)
+    if source_crs != wgs84:
+        centroid.transform(QgsCoordinateTransform(source_crs, wgs84, project))
     lon = centroid.asPoint().x()
     lat = centroid.asPoint().y()
     zone = int(math.floor((lon + 180.0) / 6.0) + 1)
+
+    # SIRGAS 2000 / UTM south: EPSG 31978..31985 for zones 18..25.
+    # SIRGAS 2000 / UTM north uses a different EPSG series; Brazil's
+    # continental applications covered by this plugin are normally south.
     if lat < 0:
-        return QgsCoordinateReferenceSystem(f"EPSG:{31900 + zone}"), zone
+        if not 18 <= zone <= 25:
+            raise ValueError(f"Zona UTM {zone}S fora da faixa SIRGAS 2000 suportada (18S-25S).")
+        return QgsCoordinateReferenceSystem(f"EPSG:{31960 + zone}"), zone
+
+    # North hemisphere: use WGS84 UTM only as a metric fallback because the
+    # current target is Brazilian south-hemisphere municipal mapping.
+    if not 18 <= zone <= 25:
+        raise ValueError(f"Zona UTM {zone}N fora da faixa suportada.")
     return QgsCoordinateReferenceSystem(f"EPSG:{32600 + zone}"), zone
 
 
@@ -94,35 +102,41 @@ def find_object_layer(layers):
 
 
 def find_zoning_layer(layers):
+    """Identify the most likely active polygon zoning layer."""
+    candidates = []
     for layer in layers:
         name = _norm(layer.name())
-        if layer.type() == 0 and layer.geometryType() == QgsWkbTypes.PolygonGeometry:
-            if any(term in name for term in ("zoneamento", "zone", "zona", "macrozone", "macrozoneamento")):
-                return layer
-            fields = {_norm(field.name()) for field in layer.fields()}
-            if any(_norm(field) in fields for field in ZONE_NAME_FIELDS):
-                return layer
-    return None
+        if layer.type() != 0 or layer.geometryType() != QgsWkbTypes.PolygonGeometry:
+            continue
+        score = 0
+        if "zoneamento" in name or "macrozoneamento" in name:
+            score += 5
+        elif "zona" in name or "zone" in name or "macrozone" in name:
+            score += 3
+        fields = {_norm(field.name()) for field in layer.fields()}
+        if any(_norm(field) in fields for field in ZONE_NAME_FIELDS):
+            score += 4
+        if score:
+            candidates.append((score, layer))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
 def zoning_name(feature, layer):
     """Return the most plausible zoning-name attribute and its field."""
     fields = {field.name(): _norm(field.name()) for field in layer.fields()}
-    # Exact/semantic priority before generic fields such as classe.
     for candidate in ZONE_NAME_FIELDS:
         for original, normalized in fields.items():
             if normalized == _norm(candidate):
                 value = feature[original]
                 if value not in (None, ""):
                     return str(value), original
-    # Fallback: first populated string field containing a zoning keyword.
     for field in layer.fields():
         normalized = _norm(field.name())
         if any(term in normalized for term in ("zone", "zona", "classe", "categoria", "descr")):
             value = feature[field.name()]
             if value not in (None, ""):
                 return str(value), field.name()
-    return feature.attribute(0) if layer.fields() else "Zona sem nome", layer.fields()[0].name() if layer.fields() else None
+    return (str(feature.attribute(0)) if layer.fields() else "Zona sem nome"), (layer.fields()[0].name() if layer.fields() else None)
 
 
 def analyze_zoning(area_layer, zoning_layer, buffer_m=500, select=True):
@@ -135,6 +149,8 @@ def analyze_zoning(area_layer, zoning_layer, buffer_m=500, select=True):
         raise ValueError("A camada de zoneamento precisa ser poligonal.")
     if buffer_m < 0:
         raise ValueError("buffer_m não pode ser negativo.")
+    if not area_layer.crs().isValid() or not zoning_layer.crs().isValid():
+        raise ValueError("Área objeto e zoneamento precisam possuir SRC válido.")
 
     area_features = list(area_layer.selectedFeatures()) or list(area_layer.getFeatures())
     if not area_features:
@@ -151,9 +167,8 @@ def analyze_zoning(area_layer, zoning_layer, buffer_m=500, select=True):
     metric_crs, utm_zone = _utm_crs_for_geometry(area_geom, area_layer.crs())
     area_metric = _transform_geometry(area_geom, area_layer.crs(), metric_crs)
     search_geom = area_metric.buffer(float(buffer_m), 12)
-
-    # Transform the search geometry to the zoning layer CRS for the spatial request.
     search_in_zoning = _transform_geometry(search_geom, metric_crs, zoning_layer.crs())
+
     request = QgsFeatureRequest().setFilterRect(search_in_zoning.boundingBox())
     candidates = []
     for feature in zoning_layer.getFeatures(request):
@@ -179,6 +194,7 @@ def analyze_zoning(area_layer, zoning_layer, buffer_m=500, select=True):
 
     results.sort(key=lambda item: (not item["inside_object"], item["distance_m"], item["zoning_name"]))
     if select:
+        zoning_layer.removeSelection()
         zoning_layer.selectByIds(selected_ids)
 
     return {
