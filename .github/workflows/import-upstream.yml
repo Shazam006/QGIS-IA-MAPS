@@ -1,0 +1,39 @@
+name: Import upstream qgis-mcp
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'upstream/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout QGIS-IA-MAPS
+        uses: actions/checkout@v6
+
+      - name: Import upstream source
+        run: |
+          rm -rf /tmp/qgis-mcp
+          git clone --depth 1 https://github.com/nkarasiak/qgis-mcp.git /tmp/qgis-mcp
+          rm -rf upstream/qgis-mcp
+          mkdir -p upstream
+          cp -R /tmp/qgis-mcp upstream/qgis-mcp
+          rm -rf upstream/qgis-mcp/.git
+
+      - name: Commit imported source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add upstream/qgis-mcp
+          if git diff --cached --quiet; then
+            echo "No upstream changes to commit."
+            exit 0
+          fi
+          git commit -m "Import upstream qgis-mcp source"
+          git push
