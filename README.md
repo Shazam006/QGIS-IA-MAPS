@@ -34,6 +34,10 @@ PyQGIS
 - salvar projeto;
 - executar uma sequência de operações como um único fluxo.
 
+## Upstream
+
+A implementação de referência `nkarasiak/qgis-mcp` é importada para `upstream/qgis-mcp` por GitHub Actions. O código upstream é mantido separado do núcleo específico do QGIS-IA-MAPS para facilitar atualização, auditoria e adaptação.
+
 ## Segurança
 
 A ponte TCP é local por padrão (`127.0.0.1:9877`). Não exponha essa porta diretamente à internet. A integração MCP externa deve usar autenticação/túnel apropriado quando necessária.
