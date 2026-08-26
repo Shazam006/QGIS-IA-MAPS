@@ -1,23 +1,33 @@
 """Local bridge between the QGIS plugin and an external MCP process.
 
-The bridge deliberately binds to loopback only. It is a small JSON-lines
-protocol intended to be replaced or wrapped by a proper MCP transport later.
-No OpenAI credentials are stored in this plugin.
+The socket listener runs in worker threads, but every PyQGIS operation is
+marshalled back to the QGIS main thread before it touches QgsProject, layouts,
+or other QGIS/Qt objects.
+
+The bridge binds to loopback only and uses a small JSON-lines protocol. It is
+not itself a full MCP transport. A separate MCP adapter can wrap this bridge.
+No OpenAI credentials are stored in the plugin.
 """
 
 import json
 import socket
 import threading
 
+from qgis.PyQt.QtCore import QObject, pyqtSignal, pyqtSlot
 
-class MCPBridge:
+
+class MCPBridge(QObject):
+    _request_signal = pyqtSignal(object)
+
     def __init__(self, controller, host="127.0.0.1", port=9877):
+        super().__init__()
         self.controller = controller
         self.host = host
         self.port = int(port)
         self._server = None
         self._thread = None
         self._stop = threading.Event()
+        self._request_signal.connect(self._process_request)
 
     @property
     def running(self):
@@ -27,27 +37,29 @@ class MCPBridge:
         if self.running:
             return
         self._stop.clear()
-        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server.bind((self.host, self.port))
-        self._server.listen(5)
-        self._server.settimeout(0.5)
-        self._thread = threading.Thread(target=self._serve, daemon=True)
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((self.host, self.port))
+        server.listen(5)
+        server.settimeout(0.5)
+        self._server = server
+        self._thread = threading.Thread(target=self._serve, args=(server,), daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
-        if self._server:
+        server = self._server
+        self._server = None
+        if server:
             try:
-                self._server.close()
+                server.close()
             except OSError:
                 pass
-        self._server = None
 
-    def _serve(self):
+    def _serve(self, server):
         while not self._stop.is_set():
             try:
-                conn, _ = self._server.accept()
+                conn, _ = server.accept()
             except (socket.timeout, OSError):
                 continue
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
@@ -55,18 +67,57 @@ class MCPBridge:
     def _handle(self, conn):
         with conn:
             file = conn.makefile("rwb")
-            for raw in file:
+            while not self._stop.is_set():
+                raw = file.readline(1024 * 1024)
+                if not raw:
+                    break
+                if len(raw) > 1024 * 1024:
+                    self._write(file, {"ok": False, "error": "Request too large"})
+                    break
                 try:
                     request = json.loads(raw.decode("utf-8"))
-                    response = self.dispatch(request)
+                    response = self._dispatch_on_main_thread(request)
                 except Exception as exc:
                     response = {"ok": False, "error": str(exc)}
-                file.write((json.dumps(response) + "\n").encode("utf-8"))
-                file.flush()
+                self._write(file, response)
+
+    @staticmethod
+    def _write(file, response):
+        payload = json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n"
+        file.write(payload.encode("utf-8"))
+        file.flush()
+
+    def _dispatch_on_main_thread(self, request):
+        context = {
+            "request": request,
+            "event": threading.Event(),
+            "response": None,
+        }
+        self._request_signal.emit(context)
+        if not context["event"].wait(30.0):
+            raise TimeoutError("QGIS did not process the request within 30 seconds")
+        response = context["response"]
+        if response is None:
+            raise RuntimeError("QGIS returned no response")
+        return response
+
+    @pyqtSlot(object)
+    def _process_request(self, context):
+        try:
+            context["response"] = self.dispatch(context["request"])
+        except Exception as exc:
+            context["response"] = {"ok": False, "error": str(exc)}
+        finally:
+            context["event"].set()
 
     def dispatch(self, request):
+        if not isinstance(request, dict):
+            raise ValueError("Request must be a JSON object")
+
         method = request.get("method")
         params = request.get("params") or {}
+        if not isinstance(params, dict):
+            raise ValueError("params must be a JSON object")
 
         if method == "ping":
             return {"ok": True, "result": {"pong": True}}
