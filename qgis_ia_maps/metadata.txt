@@ -1,9 +1,9 @@
 [general]
 name=QGIS-IA-MAPS
-description=Complemento QGIS para automação cartográfica e geração de mapas com IA
-version=0.1.5
+description=Complemento QGIS para automação cartográfica, análise territorial e geração de mapas assistida por IA
+version=0.1.6
 author=Shazam006
-about=Automação cartográfica, análise espacial, legendas inteligentes e integração controlada com MCP.
+about=Automação cartográfica, análise espacial, análise raster, zoneamento, legendas inteligentes, templates QPT e integração controlada com GPT/MCP.
 category=Plugins
 icon=icon.svg
 qgisMinimumVersion=3.34
