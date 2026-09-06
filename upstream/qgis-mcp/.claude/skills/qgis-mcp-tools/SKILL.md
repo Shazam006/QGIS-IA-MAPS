@@ -41,7 +41,7 @@ description: Reference for all qgis-mcp MCP tools, resources, and prompts (names
 | `get_algorithm_help` | Get Algorithm Help | readOnly | Algorithm parameters, outputs, description |
 | `create_processing_model` | Create Processing Model | - | Build a `.model3` workflow from a structured spec (inputs, steps, outputs); always saved into the QGIS user models folder and registered (numeric suffix on name collision); supports `@input` / `$step.OUTPUT` / `=expression` references |
 | `render_map` | Render Map | idempotent | Render canvas to inline image (60s, async+progress+logging) |
-| `execute_code` | Execute Code | destructive | Run arbitrary PyQGIS code (60s, async+progress+logging) |
+| `execute_code` | Execute Code | destructive | Run arbitrary PyQGIS code (plugin cancels past `timeout` seconds, default 55, returning `timed_out` and the output so far; result carries `elapsed`; async+progress+logging) |
 | `batch_commands` | Batch Commands | - | Multiple commands in one round-trip |
 | `list_layouts` | List Layouts | readOnly | List print layouts |
 | `export_layout` | Export Layout | idempotent | Export print layout to PDF/PNG/SVG |
@@ -63,7 +63,7 @@ description: Reference for all qgis-mcp MCP tools, resources, and prompts (names
 | `list_processing_models` | List Processing Models | readOnly | List registered Processing models (id, name, group) |
 | `run_model` | Run Model | - | Run a model by registered id or .model3 path (60s, async+progress) |
 | `get_processing_providers` | Get Processing Providers | readOnly | List providers (native/gdal/grass/...) with algo counts + active status |
-| `execute_processing_batch` | Execute Processing Batch | - | Run one algorithm over many parameter dicts; per-run status (60s) |
+| `execute_processing_batch` | Execute Processing Batch | - | Run one algorithm over many parameter dicts; per-run success/error/skipped status (`timeout` bounds the whole batch, default 55s) |
 | `raster_calculator` | Raster Calculator | - | Band math via QgsRasterCalculator, 'Name@band' refs, GeoTIFF out (60s) |
 | `zonal_statistics` | Zonal Statistics | - | Per-polygon raster stats (native:zonalstatisticsfb), memory or file out (60s) |
 | `sample_raster_values` | Sample Raster Values | readOnly | Sample pixel values at [x,y] points (raster CRS), one/all bands |
@@ -94,7 +94,7 @@ description: Reference for all qgis-mcp MCP tools, resources, and prompts (names
 | `undo_edits` | Undo Edits | - | Undo N steps on the layer's own undo stack |
 | `redo_edits` | Redo Edits | - | Redo N previously undone steps |
 | `list_connections` | List Connections | readOnly | Saved Browser-panel connections (PostgreSQL, GeoPackage, SpatiaLite, ...); passwords redacted |
-| `create_postgresql_connection` | Create PostgreSQL Connection | - | Validate and save a PostgreSQL Browser-panel connection with an existing QGIS Authentication Manager configuration; passwords are never accepted, and the caller must supply the real database port instead of assuming `5432` |
+| `create_postgresql_connection` | Create PostgreSQL Connection | - | Validate and save a password-free PostgreSQL Browser-panel connection. `connection_mode` selects the required parameters: `endpoint_using_auth_manager` (host, port, database, auth_config_id; the caller supplies the real port, never an assumed `5432`), `service_using_auth_manager` (service, auth_config_id), `service_only` (service). Service modes take `database` as an optional dbname override; parameters a mode does not use are rejected |
 | `list_connection_tables` | List Connection Tables | readOnly | Schemas, then tables with geometry column, CRS, primary key and kind |
 | `add_layer_from_connection` | Add Layer from Connection | - | Load a connection table, or a database-side SQL query, as a layer (60s) |
 | `import_layer_to_connection` | Import Layer to Connection | destructive | Write a vector layer into a connection as a new table; `overwrite` elicits (60s) |

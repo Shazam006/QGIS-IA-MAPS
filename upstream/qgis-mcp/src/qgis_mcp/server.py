@@ -17,7 +17,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
-from typing import Any
+from typing import Any, Literal
 
 try:
     from mcp.server.fastmcp import Context, FastMCP
@@ -30,6 +30,14 @@ try:
     from mcp.shared.exceptions import McpError
 except ImportError:  # mcp >= 2.0 renamed McpError -> MCPError
     from mcp.shared.exceptions import MCPError as McpError
+try:
+    from mcp.shared.exceptions import NoBackChannelError
+except ImportError:  # mcp < 2.0 has no back-channel concept (initialize() is always duplex)
+    NoBackChannelError = ()  # `except ():` catches nothing
+try:
+    from mcp.server.fastmcp.exceptions import ToolError
+except ImportError:  # mcp >= 2.0; only ToolError text reaches the client on mcp >= 2.1
+    from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import (
     Annotations,
     Completion,
@@ -46,6 +54,7 @@ from qgis_mcp.helpers import (
     DEFAULT_PORT,
     TIMEOUT_DEFAULT,
     TIMEOUT_LONG,
+    CommandTimeout,
     enrich_diagnose,
     make_layer_response,
     make_project_response,
@@ -374,6 +383,19 @@ def _send_sync(
             except _CONNECTION_ERRORS as exc:
                 last_exc = exc
                 _invalidate_connection(name)
+                if isinstance(exc, CommandTimeout):
+                    # QGIS has the command and is still working on it; only the
+                    # response was abandoned. Retrying would run it a second
+                    # time: the layer added twice, the file written twice. A slow
+                    # *connect* is a plain ConnectionError from
+                    # get_qgis_connection() and does keep its retries.
+                    logger.warning(
+                        "Command %r timed out on instance %r - not retrying (%s)",
+                        command_type,
+                        name,
+                        exc,
+                    )
+                    raise
                 if _first_connected and _is_refusal(exc):
                     # The host answered: nothing is listening on that port. Another
                     # instance has already connected, so this is a closed QGIS
@@ -406,7 +428,7 @@ def _send_sync(
             raise last_exc  # type: ignore[misc]  # unreachable, but satisfies type checker
 
     if not result or result.get("status") == "error":
-        raise RuntimeError(result.get("message", "Command failed") if result else "No response")
+        raise ToolError(result.get("message", "Command failed") if result else "No response")
     return result.get("result", {})
 
 
@@ -441,7 +463,7 @@ async def _send(
         hint = _get_error_hint(message)
         if hint:
             logger.warning(f"Error hint added for: {message}")
-            raise RuntimeError(f"{message}\n\nHINT: {hint}") from exc
+            raise ToolError(f"{message}\n\nHINT: {hint}") from exc
         raise
 
 
@@ -461,7 +483,10 @@ async def _confirm_destructive(ctx: Context, message: str) -> bool:
 
     Returns True if client doesn't support elicitation (fail-open), since
     the tool is already marked destructive via ToolAnnotations and the client
-    can gate execution at the tool-call level.
+    can gate execution at the tool-call level. Raises ToolError if the
+    request could not be delivered at all (fail-closed) - client capability is
+    unknown in that case, so proceeding would silently defeat the confirmation
+    gate the caller explicitly opted into.
 
     Skipped by default: MCP clients gate destructive tool calls themselves
     (helped by the destructiveHint annotation), so eliciting here is a second
@@ -479,6 +504,18 @@ async def _confirm_destructive(ctx: Context, message: str) -> bool:
         return True
     try:
         response = await ctx.elicit(message=message, schema=_ConfirmSchema)
+    except NoBackChannelError as e:
+        # The client may well support elicitation - this connection just has no
+        # channel for server-initiated requests (protocol 2026-07-28 per-request
+        # dispatch, stateless or JSON-response streamable HTTP). We were never
+        # able to ask, so - unlike genuine "client doesn't support elicitation" -
+        # fail closed: QGIS_MCP_AUTO_CONFIRM=0 means the operator wants a gate.
+        raise ToolError(
+            "Cannot confirm destructive operation: this connection has no "
+            "back-channel for server-initiated requests, so the confirmation "
+            "prompt cannot be sent. Unset QGIS_MCP_AUTO_CONFIRM to rely on the "
+            "client's own destructive-tool gate instead."
+        ) from e
     except McpError:
         # Client doesn't support elicitation - proceed (fail-open).
         # The destructive ToolAnnotations hint lets clients gate at call time.
@@ -1456,20 +1493,26 @@ async def get_processing_providers(ctx: Context, instance: str | None = None) ->
     title="Execute Processing Batch",
     description="Run one algorithm once per parameter dict in 'parameters_list'. "
     "Returns a per-run result with index and success/error status. Use for applying "
-    "the same operation over many inputs in a single round-trip.",
+    "the same operation over many inputs in a single round-trip. timeout: seconds for the "
+    "whole batch (default 55); runs that would start after it has elapsed come back as "
+    "'skipped' with the completed ones intact, so raise it or split the list for big batches.",
 )
 async def execute_processing_batch(
     ctx: Context,
     algorithm: str,
     parameters_list: list[dict],
+    timeout: int | None = None,
     instance: str | None = None,
 ) -> dict:
     await ctx.info(f"Batch processing {algorithm}: {len(parameters_list)} run(s)")
+    params: dict[str, Any] = {"algorithm": algorithm, "parameters_list": parameters_list}
+    if timeout is None:
+        socket_timeout = TIMEOUT_LONG
+    else:
+        params["timeout"] = timeout
+        socket_timeout = int(timeout) + 5
     return await _send(
-        "execute_processing_batch",
-        {"algorithm": algorithm, "parameters_list": parameters_list},
-        timeout=TIMEOUT_LONG,
-        instance=instance,
+        "execute_processing_batch", params, timeout=socket_timeout, instance=instance
     )
 
 
@@ -1708,16 +1751,31 @@ async def render_map(
     title="Execute Code",
     annotations=ToolAnnotations(destructiveHint=True),
     description="Execute arbitrary PyQGIS code. Use for operations not covered by other tools. "
-    "Has access to QgsProject, iface, and core QGIS classes. Returns stdout/stderr.",
+    "Has access to QgsProject, iface, and core QGIS classes. Returns stdout/stderr and elapsed "
+    "seconds. timeout: seconds before the script is cancelled (default 55); a script that runs "
+    "past it comes back with timed_out=True and the output printed so far, and its side effects "
+    "stand. Raise timeout or split bulk work into several calls; QGIS is unresponsive while a "
+    "script runs. A single blocking call (time.sleep, GDAL) cannot be interrupted before it returns.",
 )
-async def execute_code(ctx: Context, code: str, instance: str | None = None) -> dict:
+async def execute_code(
+    ctx: Context, code: str, timeout: int | None = None, instance: str | None = None
+) -> dict:
     if not await _confirm_destructive(
         ctx, "Execute arbitrary PyQGIS code? This can modify your project and system."
     ):
         return {"ok": False, "message": "Cancelled by user"}
     await ctx.info("Executing PyQGIS code...")
     await ctx.report_progress(0, 100)
-    result = await _send("execute_code", {"code": code}, timeout=TIMEOUT_LONG, instance=instance)
+    params: dict[str, Any] = {"code": code}
+    # Same ordering as execute_processing: the plugin's deadline comes first so
+    # the caller gets a message and the partial output instead of a client
+    # timeout while QGIS keeps running the script (#43).
+    if timeout is None:
+        socket_timeout = TIMEOUT_LONG
+    else:
+        params["timeout"] = timeout
+        socket_timeout = int(timeout) + 5
+    result = await _send("execute_code", params, timeout=socket_timeout, instance=instance)
     await ctx.report_progress(100, 100)
     return result
 
@@ -2265,32 +2323,44 @@ async def list_connections(
 
 @mcp.tool(
     title="Create PostgreSQL Connection",
-    description="Validate and save a new PostgreSQL Browser-panel connection. Credentials must be held in "
-    "an existing QGIS Authentication Manager configuration; passwords are never accepted. Fails "
-    "if name already exists or the database cannot be reached. port must be the actual database "
-    "port supplied by the caller or user - this tool does not assume a default such as 5432. "
-    "ssl_mode is one of prefer (default), disable, allow, require, verify-ca, or verify-full.",
+    description="Validate and save a new PostgreSQL Browser-panel connection. Passwords are never "
+    "accepted: credentials come from a QGIS Authentication Manager configuration, from the libpq "
+    "service file (pg_service.conf), or both. connection_mode selects which parameters are "
+    "required; when the user's intent is unclear, ask which mode applies before calling. "
+    "endpoint_using_auth_manager: host, port, database, auth_config_id (port must be the actual "
+    "database port supplied by the caller or user, this tool never assumes 5432). "
+    "service_using_auth_manager: service (the name defined in pg_service.conf) and auth_config_id; "
+    "database optionally overrides the service file's dbname. service_only: service; database "
+    "optionally overrides dbname; do not pass auth_config_id. Parameters a mode does not use are "
+    "rejected. Fails if name already exists or the database cannot be reached. ssl_mode is one of "
+    "prefer (default), disable, allow, require, verify-ca, or verify-full.",
     structured_output=True,
 )
 async def create_postgresql_connection(
     ctx: Context,
     name: str,
-    host: str,
-    port: int,
-    database: str,
-    auth_config_id: str,
+    connection_mode: Literal[
+        "endpoint_using_auth_manager", "service_using_auth_manager", "service_only"
+    ],
+    host: str | None = None,
+    port: int | None = None,
+    database: str | None = None,
+    auth_config_id: str | None = None,
     ssl_mode: str = "prefer",
+    service: str | None = None,
     instance: str | None = None,
 ) -> dict[str, Any]:
     return await _send(
         "create_postgresql_connection",
         {
             "name": name,
+            "connection_mode": connection_mode,
             "host": host,
             "port": port,
             "database": database,
             "auth_config_id": auth_config_id,
             "ssl_mode": ssl_mode,
+            "service": service,
         },
         timeout=TIMEOUT_LONG,
         instance=instance,

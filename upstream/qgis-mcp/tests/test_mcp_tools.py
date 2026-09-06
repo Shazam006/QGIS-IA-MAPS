@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from mcp_compat import make_mcp_error
 
 from qgis_mcp.helpers import HEADER_STRUCT, get_auth_token
-from qgis_mcp.server import QgisMCPClient, _ConfirmSchema, _send_sync
+from qgis_mcp.protocol import CommandTimeout
+from qgis_mcp.server import NoBackChannelError, QgisMCPClient, ToolError, _ConfirmSchema, _send_sync
 
 # --- Fixtures ---
 
@@ -68,13 +69,13 @@ def test_send_unwraps_success_envelope(mock_connection):
 
 def test_send_raises_on_error(mock_connection):
     mock_connection.send_command.return_value = {"status": "error", "message": "Layer not found"}
-    with pytest.raises(RuntimeError, match="Layer not found"):
+    with pytest.raises(ToolError, match="Layer not found"):
         _send_sync("get_layer_features", {"layer_id": "bad_id"})
 
 
 def test_send_raises_on_none_response(mock_connection):
     mock_connection.send_command.return_value = None
-    with pytest.raises(RuntimeError, match="No response"):
+    with pytest.raises(ToolError, match="No response"):
         _send_sync("ping")
 
 
@@ -173,6 +174,55 @@ def test_first_connect_uses_patient_retries():
     # Verify escalating delays: 1.0, 2.0, 3.0, 5.0
     delays = [call.args[0] for call in mock_sleep.call_args_list]
     assert delays == [1.0, 2.0, 3.0, 5.0]
+
+
+def test_command_timeout_is_not_retried():
+    """A timed-out command already reached QGIS, so retrying would run it twice."""
+    import qgis_mcp.server as srv
+
+    client = MagicMock(spec=QgisMCPClient)
+    client.socket = MagicMock()
+    client.socket.getpeername.return_value = ("localhost", 9876)
+    client.send_command.side_effect = CommandTimeout("Socket operation timed out after 30s")
+
+    srv._first_connected.add("default")
+    try:
+        with (
+            patch("qgis_mcp.server.get_qgis_connection", return_value=client),
+            patch("qgis_mcp.server._invalidate_connection") as mock_invalidate,
+            patch("qgis_mcp.server.time.sleep") as mock_sleep,
+            pytest.raises(CommandTimeout),
+        ):
+            _send_sync("add_raster_layer", {"path": "/tmp/x.tif"})
+    finally:
+        srv._first_connected.discard("default")
+
+    assert client.send_command.call_count == 1
+    mock_sleep.assert_not_called()
+    # The socket still has an abandoned response coming, so it must go.
+    mock_invalidate.assert_called_once_with("default")
+
+
+def test_connect_timeout_still_retries():
+    """A slow *connect* leaves nothing running in QGIS, so patience still applies."""
+    import qgis_mcp.server as srv
+
+    failure = ConnectionError("Could not connect to QGIS instance 'default'")
+    failure.__cause__ = TimeoutError("timed out")
+
+    srv._first_connected.discard("default")
+    try:
+        with (
+            patch("qgis_mcp.server.get_qgis_connection", side_effect=failure) as mock_connect,
+            patch("qgis_mcp.server._invalidate_connection"),
+            patch("qgis_mcp.server.time.sleep"),
+            pytest.raises(ConnectionError),
+        ):
+            _send_sync("ping")
+    finally:
+        srv._first_connected.discard("default")
+
+    assert mock_connect.call_count == 5
 
 
 # --- Tool-level tests (all async) ---
@@ -351,6 +401,36 @@ async def test_execute_code_tool(mock_connection):
     result = await execute_code(ctx, code="print('hello')")
     assert result["stdout"] == "hello"
     ctx.info.assert_awaited_once_with("Executing PyQGIS code...")
+
+
+@pytest.mark.asyncio
+async def test_execute_code_timeout_keeps_the_plugin_deadline_first(mock_connection):
+    """#43: like execute_processing, the plugin must give up 5s before the socket does."""
+    mock_connection.send_command.return_value = {"status": "success", "result": {"executed": True}}
+    from qgis_mcp.server import execute_code
+
+    await execute_code(_make_ctx(), code="x = 1")
+    mock_connection.send_command.assert_called_once_with(
+        "execute_code", {"code": "x = 1"}, timeout=60
+    )
+    mock_connection.send_command.reset_mock()
+    await execute_code(_make_ctx(), code="x = 1", timeout=300)
+    mock_connection.send_command.assert_called_once_with(
+        "execute_code", {"code": "x = 1", "timeout": 300}, timeout=305
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_processing_batch_timeout_bounds_the_whole_batch(mock_connection):
+    mock_connection.send_command.return_value = {"status": "success", "result": {"results": []}}
+    from qgis_mcp.server import execute_processing_batch
+
+    await execute_processing_batch(_make_ctx(), algorithm="a", parameters_list=[{}], timeout=120)
+    mock_connection.send_command.assert_called_once_with(
+        "execute_processing_batch",
+        {"algorithm": "a", "parameters_list": [{}], "timeout": 120},
+        timeout=125,
+    )
 
 
 # --- QgisMCPClient tests ---
@@ -754,7 +834,7 @@ async def test_reload_plugin_self_blocked(mock_connection):
     from qgis_mcp.server import reload_plugin
 
     ctx = _make_ctx()
-    with pytest.raises(RuntimeError, match="Cannot reload MCP plugin"):
+    with pytest.raises(ToolError, match="Cannot reload MCP plugin"):
         await reload_plugin(ctx, plugin_name="qgis_mcp_plugin")
 
 
@@ -2024,6 +2104,34 @@ async def test_destructive_tool_actually_elicits(mock_connection):
 
 
 @pytest.mark.asyncio
+async def test_destructive_tool_fails_closed_without_back_channel(mock_connection):
+    """A connection with no back-channel must fail closed, not open.
+
+    Under mcp>=2.0's Client(mode="auto"), ctx.elicit() raises NoBackChannelError
+    whatever the client's elicitation support, so the old fail-open ran
+    destructive tools unconfirmed (#41). Same real-dispatch setup as
+    test_destructive_tool_actually_elicits (#27).
+    """
+    pytest.importorskip(
+        "mcp.client.client", reason='mode="auto" negotiation needs the mcp>=2.0 Client'
+    )
+    from mcp.client.client import Client
+
+    from qgis_mcp.server import mcp
+
+    mock_connection.send_command.return_value = {"status": "success", "result": {"ok": True}}
+
+    client = Client(mcp, mode="auto")
+    async with client:
+        result = await client.call_tool("remove_layer", {"layer_id": "L1"})
+
+    # No back-channel to ask on, so the operation must not reach QGIS.
+    assert mock_connection.send_command.call_count == 0
+    assert result.is_error is True
+    assert "back-channel" in result.content[0].text.lower()
+
+
+@pytest.mark.asyncio
 async def test_confirm_destructive_declined_blocks_send(mock_connection):
     """A declined confirmation must abort rather than fall through to fail-open."""
     from qgis_mcp.server import remove_layer
@@ -2042,6 +2150,20 @@ async def test_confirm_destructive_reraises_non_mcp_errors(mock_connection):
     ctx = _make_ctx()
     ctx.elicit = AsyncMock(side_effect=AttributeError("'dict' object has no attribute ..."))
     with pytest.raises(AttributeError):
+        await _confirm_destructive(ctx, "Remove layer?")
+
+
+@pytest.mark.asyncio
+async def test_confirm_destructive_fails_closed_on_no_back_channel(mock_connection):
+    """A NoBackChannelError means we couldn't ask, not that the client can't answer - fail closed."""
+    from qgis_mcp.server import _confirm_destructive
+
+    if not NoBackChannelError:
+        pytest.skip("NoBackChannelError needs mcp>=2.0")
+
+    ctx = _make_ctx()
+    ctx.elicit = AsyncMock(side_effect=NoBackChannelError("elicitation/create"))
+    with pytest.raises(ToolError, match="back-channel"):
         await _confirm_destructive(ctx, "Remove layer?")
 
 
@@ -2945,6 +3067,7 @@ async def test_create_postgresql_connection_uses_auth_config_and_long_timeout(mo
     output = await create_postgresql_connection(
         _make_ctx(),
         name="warehouse",
+        connection_mode="endpoint_using_auth_manager",
         host="db.example.test",
         port=5433,
         database="gis",
@@ -2956,11 +3079,13 @@ async def test_create_postgresql_connection_uses_auth_config_and_long_timeout(mo
         "create_postgresql_connection",
         {
             "name": "warehouse",
+            "connection_mode": "endpoint_using_auth_manager",
             "host": "db.example.test",
             "port": 5433,
             "database": "gis",
             "auth_config_id": "authcfg1",
             "ssl_mode": "verify-full",
+            "service": None,
         },
         timeout=60,
     )
