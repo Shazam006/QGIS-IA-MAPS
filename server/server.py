@@ -1,10 +1,9 @@
 """QGIS-IA-MAPS MCP adapter.
 
-This process exposes high-level cartographic tools through MCP and forwards
-commands to the local QGIS plugin over its loopback JSON-lines bridge.
-
-The server does not contain OpenAI credentials. Deployment behind HTTPS and
-authentication is intentionally external to this package.
+This server exposes the current QGIS installation as a controlled tool surface
+for GPT. It forwards structured requests to the local QGIS-IA-MAPS bridge.
+No OpenAI credentials are stored here and arbitrary Python execution is not
+exposed.
 """
 
 import json
@@ -22,8 +21,8 @@ mcp = FastMCP("QGIS-IA-MAPS")
 
 def call_qgis(method, params=None):
     request = {"method": method, "params": params or {}}
-    with closing(socket.create_connection((HOST, PORT), timeout=15)) as sock:
-        sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+    with closing(socket.create_connection((HOST, PORT), timeout=30)) as sock:
+        sock.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
         data = b""
         while not data.endswith(b"\n"):
             chunk = sock.recv(65536)
@@ -40,57 +39,112 @@ def call_qgis(method, params=None):
 
 @mcp.tool()
 def qgis_ping() -> dict:
-    """Check whether the QGIS-IA-MAPS plugin is reachable."""
+    """Check whether the QGIS-IA-MAPS agent bridge is reachable."""
     return call_qgis("ping")
 
 
 @mcp.tool()
-def qgis_project_info() -> dict:
-    """Return information about the current QGIS project."""
-    return call_qgis("project.info")
+def qgis_context() -> dict:
+    """Return compact structured context for the currently open QGIS project."""
+    return call_qgis("project.context")
 
 
 @mcp.tool()
-def qgis_list_layers() -> list:
-    """List layers loaded in the current QGIS project."""
-    return call_qgis("project.layers")
+def qgis_capabilities() -> dict:
+    """Return installed QGIS providers and available high-level capability groups."""
+    return call_qgis("capabilities.list")
 
 
+@mcp.tool()
+def qgis_processing_providers() -> list:
+    """List Processing providers available in this QGIS installation."""
+    return call_qgis("processing.providers")
+
+
+@mcp.tool()
+def qgis_processing_algorithms(provider_id: str | None = None, search: str | None = None, limit: int = 200) -> list:
+    """Search algorithms registered in the local QGIS Processing registry."""
+    return call_qgis("processing.algorithms", {"provider_id": provider_id, "search": search, "limit": limit})
+
+
+@mcp.tool()
+def qgis_processing_describe(algorithm_id: str) -> dict:
+    """Describe one Processing algorithm, including parameters and outputs."""
+    return call_qgis("processing.describe", {"algorithm_id": algorithm_id})
+
+
+@mcp.tool()
+def qgis_processing_validate(algorithm_id: str, parameters: dict) -> dict:
+    """Validate a planned Processing call before execution."""
+    return call_qgis("processing.validate", {"algorithm_id": algorithm_id, "parameters": parameters})
+
+
+@mcp.tool()
+def qgis_processing_run(algorithm_id: str, parameters: dict, add_outputs_to_project: bool = True) -> dict:
+    """Run a registered QGIS Processing algorithm with validated parameters."""
+    return call_qgis("processing.run", {
+        "algorithm_id": algorithm_id,
+        "parameters": parameters,
+        "add_outputs_to_project": add_outputs_to_project,
+    })
+
+
+@mcp.tool()
+def qgis_set_layer_visibility(layer_id: str, visible: bool = True) -> dict:
+    """Show or hide a layer in the current QGIS project."""
+    return call_qgis("layer.set_visibility", {"layer_id": layer_id, "visible": visible})
+
+
+@mcp.tool()
+def qgis_set_active_layer(layer_id: str) -> dict:
+    """Set the active QGIS layer."""
+    return call_qgis("layer.set_active", {"layer_id": layer_id})
+
+
+@mcp.tool()
+def qgis_zoom_to_layer(layer_id: str) -> dict:
+    """Zoom the QGIS canvas to a layer."""
+    return call_qgis("layer.zoom", {"layer_id": layer_id})
+
+
+@mcp.tool()
+def qgis_zoom_to_selection(layer_id: str) -> dict:
+    """Zoom the QGIS canvas to selected features in a layer."""
+    return call_qgis("layer.zoom_selection", {"layer_id": layer_id})
+
+
+@mcp.tool()
+def qgis_clear_selection(layer_id: str) -> dict:
+    """Clear the selection of a vector layer."""
+    return call_qgis("selection.clear", {"layer_id": layer_id})
+
+
+@mcp.tool()
+def qgis_remove_layer(layer_id: str, confirm: bool = False) -> dict:
+    """Remove a layer from the project. Destructive: confirm must be true."""
+    return call_qgis("layer.remove", {"layer_id": layer_id, "confirm": confirm})
+
+
+@mcp.tool()
+def qgis_save_project(path: str | None = None) -> dict:
+    """Save the current QGIS project, optionally to a new path."""
+    return call_qgis("project.save", {"path": path})
+
+
+# Cartographic functions remain available, but are only one module of the agent.
 @mcp.tool()
 def qgis_create_layout(name: str = "Mapa IA", page: str = "A4", orientation: str = "landscape") -> dict:
-    """Create a map layout in QGIS."""
     return call_qgis("map.create_layout", {"name": name, "page": page, "orientation": orientation})
 
 
 @mcp.tool()
-def qgis_add_title(layout_name: str, text: str, size: float = 14, x: float = 20, y: float = 5) -> bool:
-    """Add a title to a QGIS layout."""
-    return call_qgis("map.add_title", {"layout_name": layout_name, "text": text, "size": size, "x": x, "y": y})
+def qgis_export_map(name: str, path: str, format: str = "pdf") -> dict:
+    return call_qgis("map.export", {"name": name, "path": path, "format": format})
 
 
-@mcp.tool()
-def qgis_add_legend(layout_name: str, title: str = "Legenda", x: float = 220, y: float = 20) -> bool:
-    """Add a legend to a QGIS layout."""
-    return call_qgis("map.add_legend", {"layout_name": layout_name, "title": title, "x": x, "y": y})
-
-
-@mcp.tool()
-def qgis_add_scale(layout_name: str, x: float = 20, y: float = 185) -> bool:
-    """Add a scale bar to a QGIS layout."""
-    return call_qgis("map.add_scale", {"layout_name": layout_name, "x": x, "y": y})
-
-
-@mcp.tool()
-def qgis_export_map(layout_name: str, path: str, format: str = "pdf") -> bool:
-    """Export a QGIS layout as PDF or PNG."""
-    return call_qgis("map.export", {"layout_name": layout_name, "path": path, "format": format})
-
-
-@mcp.tool()
-def qgis_save_project(path: str | None = None) -> bool:
-    """Save the current QGIS project, optionally changing its path."""
-    return call_qgis("project.save", {"path": path})
+def main():
+    mcp.run()
 
 
 if __name__ == "__main__":
-    mcp.run()
+    main()
