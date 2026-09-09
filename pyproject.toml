@@ -3,12 +3,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["qgis_ia_maps_server"]
+packages = ["server"]
 
 [project]
 name = "qgis-ia-maps"
-version = "0.1.0"
-description = "QGIS map automation bridge for AI and MCP"
+version = "0.3.0.dev0"
+description = "Agentic QGIS assistant for geoprocessing, spatial analysis, cartography and controlled GPT/MCP execution"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,4 +17,4 @@ dependencies = [
 ]
 
 [project.scripts]
-qgis-ia-maps-server = "qgis_ia_maps_server.server:main"
+qgis-ia-maps-server = "server.server:main"
