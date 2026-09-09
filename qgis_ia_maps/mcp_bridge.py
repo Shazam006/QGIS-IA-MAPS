@@ -1,12 +1,8 @@
-"""Local bridge between the QGIS plugin and an external MCP process.
+"""Local execution gateway for QGIS-IA-MAPS.
 
-The socket listener runs in worker threads, but every PyQGIS operation is
-marshalled back to the QGIS main thread before it touches QgsProject, layouts,
-or other QGIS/Qt objects.
-
-The bridge binds to loopback only and uses a small JSON-lines protocol. It is
-not itself a full MCP transport. A separate MCP adapter can wrap this bridge.
-No OpenAI credentials are stored in the plugin.
+The bridge exposes a controlled JSON-lines API over loopback. Worker threads
+never touch PyQGIS directly: every request is marshalled to the QGIS main
+thread. Arbitrary Python execution is intentionally not supported.
 """
 
 import json
@@ -14,6 +10,11 @@ import socket
 import threading
 
 from qgis.PyQt.QtCore import QObject, pyqtSignal, pyqtSlot
+
+from .agent_actions import AgentActions
+from .capabilities import CapabilityRegistry
+from .processing_executor import ProcessingExecutor
+from .project_context import ProjectContextBuilder
 
 
 class MCPBridge(QObject):
@@ -28,6 +29,12 @@ class MCPBridge(QObject):
         self._thread = None
         self._stop = threading.Event()
         self._request_signal.connect(self._process_request)
+
+        iface = controller.iface
+        self.capabilities = CapabilityRegistry()
+        self.context_builder = ProjectContextBuilder(iface)
+        self.processing = ProcessingExecutor(iface)
+        self.actions = AgentActions(iface)
 
     @property
     def running(self):
@@ -88,18 +95,13 @@ class MCPBridge(QObject):
         file.flush()
 
     def _dispatch_on_main_thread(self, request):
-        context = {
-            "request": request,
-            "event": threading.Event(),
-            "response": None,
-        }
+        context = {"request": request, "event": threading.Event(), "response": None}
         self._request_signal.emit(context)
-        if not context["event"].wait(30.0):
-            raise TimeoutError("QGIS did not process the request within 30 seconds")
-        response = context["response"]
-        if response is None:
+        if not context["event"].wait(60.0):
+            raise TimeoutError("QGIS did not process the request within 60 seconds")
+        if context["response"] is None:
             raise RuntimeError("QGIS returned no response")
-        return response
+        return context["response"]
 
     @pyqtSlot(object)
     def _process_request(self, context):
@@ -113,18 +115,54 @@ class MCPBridge(QObject):
     def dispatch(self, request):
         if not isinstance(request, dict):
             raise ValueError("Request must be a JSON object")
-
         method = request.get("method")
         params = request.get("params") or {}
         if not isinstance(params, dict):
             raise ValueError("params must be a JSON object")
 
+        # Discovery and project awareness.
         if method == "ping":
-            return {"ok": True, "result": {"pong": True}}
+            return {"ok": True, "result": {"pong": True, "mode": "agentic-qgis"}}
+        if method == "capabilities.list":
+            return {"ok": True, "result": self.capabilities.snapshot()}
+        if method == "processing.providers":
+            return {"ok": True, "result": self.capabilities.providers()}
+        if method == "processing.algorithms":
+            return {"ok": True, "result": self.capabilities.algorithms(**params)}
+        if method == "processing.describe":
+            return {"ok": True, "result": self.capabilities.describe(**params)}
+        if method == "project.context":
+            return {"ok": True, "result": self.context_builder.build()}
         if method == "project.info":
             return {"ok": True, "result": self.controller.project_info()}
         if method == "project.layers":
             return {"ok": True, "result": self.controller.list_layers()}
+
+        # Generic QGIS Processing execution.
+        if method == "processing.validate":
+            return {"ok": True, "result": self.processing.validate(**params)}
+        if method == "processing.run":
+            return {"ok": True, "result": self.processing.run(**params)}
+
+        # Controlled non-Processing actions.
+        if method == "layer.set_visibility":
+            return {"ok": True, "result": self.actions.set_visibility(**params)}
+        if method == "layer.set_active":
+            return {"ok": True, "result": self.actions.set_active_layer(**params)}
+        if method == "layer.zoom":
+            return {"ok": True, "result": self.actions.zoom_to_layer(**params)}
+        if method == "layer.zoom_selection":
+            return {"ok": True, "result": self.actions.zoom_to_selection(**params)}
+        if method == "selection.clear":
+            return {"ok": True, "result": self.actions.clear_selection(**params)}
+        if method == "layer.remove":
+            return {"ok": True, "result": self.actions.remove_layer(**params)}
+        if method == "layer.rename":
+            return {"ok": True, "result": self.actions.rename_layer_display(**params)}
+        if method == "project.save":
+            return {"ok": True, "result": self.actions.save_project(**params)}
+
+        # Existing cartographic commands remain available as one module among many.
         if method == "map.create_layout":
             return {"ok": True, "result": self.controller.create_layout(**params)}
         if method == "map.add_title":
@@ -135,7 +173,5 @@ class MCPBridge(QObject):
             return {"ok": True, "result": self.controller.add_scale(**params)}
         if method == "map.export":
             return {"ok": True, "result": self.controller.export_layout(**params)}
-        if method == "project.save":
-            return {"ok": True, "result": self.controller.save_project(**params)}
 
         raise ValueError(f"Método não suportado: {method}")
